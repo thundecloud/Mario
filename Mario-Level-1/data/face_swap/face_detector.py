@@ -1,67 +1,94 @@
 """
-Face detection and extraction module using MediaPipe.
+Face detection and extraction module using MediaPipe Tasks API.
 """
 
 import cv2
 import numpy as np
 import mediapipe as mp
+import os
+
+# Path to model files
+_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+_FACE_DETECTOR_MODEL = os.path.join(_MODELS_DIR, 'blaze_face_short_range.tflite')
+_FACE_LANDMARKER_MODEL = os.path.join(_MODELS_DIR, 'face_landmarker.task')
+
+
+def _download_models():
+    """Download model files if they don't exist."""
+    import urllib.request
+    os.makedirs(_MODELS_DIR, exist_ok=True)
+
+    if not os.path.exists(_FACE_DETECTOR_MODEL):
+        url = 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite'
+        urllib.request.urlretrieve(url, _FACE_DETECTOR_MODEL)
+
+    if not os.path.exists(_FACE_LANDMARKER_MODEL):
+        url = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task'
+        urllib.request.urlretrieve(url, _FACE_LANDMARKER_MODEL)
 
 
 class FaceDetector:
-    """Detects faces and extracts face regions using MediaPipe."""
+    """Detects faces and extracts face regions using MediaPipe Tasks API."""
 
     def __init__(self):
-        self.mp_face_detection = mp.solutions.face_detection
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_detection = self.mp_face_detection.FaceDetection(
-            model_selection=1, min_detection_confidence=0.5
+        _download_models()
+
+        BaseOptions = mp.tasks.BaseOptions
+        VisionRunningMode = mp.tasks.vision.RunningMode
+
+        # Face detector
+        det_options = mp.tasks.vision.FaceDetectorOptions(
+            base_options=BaseOptions(model_asset_path=_FACE_DETECTOR_MODEL),
+            running_mode=VisionRunningMode.IMAGE,
+            min_detection_confidence=0.5,
         )
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            static_image_mode=True,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5
+        self.face_detector = mp.tasks.vision.FaceDetector.create_from_options(det_options)
+
+        # Face landmarker
+        lm_options = mp.tasks.vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=_FACE_LANDMARKER_MODEL),
+            running_mode=VisionRunningMode.IMAGE,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
         )
+        self.face_landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(lm_options)
 
     def detect_face_bbox(self, image):
         """Detect face bounding box in BGR image.
         Returns (x, y, w, h) or None if no face found."""
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = self.face_detection.process(rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = self.face_detector.detect(mp_image)
 
-        if not results.detections:
+        if not result.detections:
             return None
 
         # Take the detection with highest confidence
-        best = max(results.detections, key=lambda d: d.score[0])
-        bbox = best.location_data.relative_bounding_box
+        best = max(result.detections, key=lambda d: d.categories[0].score)
+        bbox = best.bounding_box
         h, w = image.shape[:2]
 
-        x = int(bbox.xmin * w)
-        y = int(bbox.ymin * h)
-        bw = int(bbox.width * w)
-        bh = int(bbox.height * h)
-
-        # Clamp to image bounds
-        x = max(0, x)
-        y = max(0, y)
-        bw = min(bw, w - x)
-        bh = min(bh, h - y)
+        x = max(0, bbox.origin_x)
+        y = max(0, bbox.origin_y)
+        bw = min(bbox.width, w - x)
+        bh = min(bbox.height, h - y)
 
         return (x, y, bw, bh)
 
     def get_face_landmarks(self, image):
-        """Get 478 face mesh landmarks.
+        """Get face mesh landmarks.
         Returns list of (x, y) pixel coordinates or None."""
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = self.face_mesh.process(rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = self.face_landmarker.detect(mp_image)
 
-        if not results.multi_face_landmarks:
+        if not result.face_landmarks:
             return None
 
         h, w = image.shape[:2]
         landmarks = []
-        for lm in results.multi_face_landmarks[0].landmark:
+        for lm in result.face_landmarks[0]:
             landmarks.append((int(lm.x * w), int(lm.y * h)))
 
         return landmarks
@@ -93,7 +120,6 @@ class FaceDetector:
 
         if landmarks is not None:
             # Create convex hull mask from face oval landmarks
-            # Face oval indices in MediaPipe
             face_oval_indices = [
                 10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
                 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
@@ -104,7 +130,6 @@ class FaceDetector:
             for idx in face_oval_indices:
                 if idx < len(landmarks):
                     px, py = landmarks[idx]
-                    # Adjust coordinates to face_region
                     oval_points.append((px - x1, py - y1))
 
             if oval_points:
@@ -133,5 +158,5 @@ class FaceDetector:
 
     def close(self):
         """Release resources."""
-        self.face_detection.close()
-        self.face_mesh.close()
+        self.face_detector.close()
+        self.face_landmarker.close()
