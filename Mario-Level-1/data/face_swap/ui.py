@@ -6,6 +6,7 @@ Integrates face capture, detection, style transfer, and sprite replacement.
 import pygame as pg
 import cv2
 import numpy as np
+import math
 import sys
 import os
 import threading
@@ -13,7 +14,7 @@ import threading
 # Add parent paths so we can import game modules
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from .face_capture import capture_from_camera, upload_photo
+from .face_capture import CameraCapture, upload_photo
 from .face_detector import FaceDetector
 from .style_transfer import apply_style, STYLE_FUNCTIONS
 from .sprite_replacer import SpriteReplacer
@@ -49,7 +50,7 @@ class FaceSwapUI:
         self.face_rgba = None       # Extracted face RGBA (BGRA format)
         self.styled_face = None     # After style applied (BGRA format)
         self.selected_style = 'sprite'
-        self.state = 'main_menu'    # main_menu, preview, style_select
+        self.state = 'main_menu'    # main_menu, preview, style_select, manual_select
 
         # Style cache: {style_name: bgra_array}
         self._style_cache = {}
@@ -61,6 +62,14 @@ class FaceSwapUI:
         self._loading_style = None
         self._loading_dots = 0
         self._loading_timer = 0
+
+        # Manual selection state
+        self._select_start = None
+        self._select_end = None
+        self._selecting = False
+        self._manual_photo_surface = None
+        self._manual_photo_rect = None
+        self._manual_scale = 1.0
 
         # Font setup
         self.title_font = pg.font.SysFont('Microsoft YaHei', 48, bold=True)
@@ -80,13 +89,25 @@ class FaceSwapUI:
                     if event.key == pg.K_ESCAPE:
                         if self.state == 'main_menu':
                             return None, None
+                        elif self.state == 'manual_select':
+                            self.state = 'preview' if self.face_rgba else 'main_menu'
                         else:
                             self.state = 'main_menu'
                 elif event.type == pg.MOUSEBUTTONDOWN:
-                    if event.button == 1 and not self._loading:
-                        result = self._handle_click(event.pos)
-                        if result is not None:
-                            return result
+                    if event.button == 1:
+                        if self.state == 'manual_select':
+                            self._handle_manual_select_events(event)
+                        elif not self._loading:
+                            result = self._handle_click(event.pos)
+                            if result is not None:
+                                return result
+                elif event.type == pg.MOUSEMOTION:
+                    if self.state == 'manual_select' and self._selecting:
+                        self._select_end = event.pos
+                elif event.type == pg.MOUSEBUTTONUP:
+                    if event.button == 1 and self.state == 'manual_select' and self._selecting:
+                        self._selecting = False
+                        self._select_end = event.pos
 
             # Check if async loading finished
             self._check_loading_done()
@@ -98,6 +119,8 @@ class FaceSwapUI:
                 self._draw_preview()
             elif self.state == 'style_select':
                 self._draw_style_select()
+            elif self.state == 'manual_select':
+                self._draw_manual_select()
 
             pg.display.flip()
             self.clock.tick(30)
@@ -142,16 +165,20 @@ class FaceSwapUI:
         elif self.state == 'preview':
             # Confirm button
             btn_y = 500
-            if self._is_in_button(x, y, self.screen_w//2 + 80, btn_y, 160, 50):
+            if self._is_in_button(x, y, self.screen_w//2 + 150, btn_y, 140, 50):
                 self.state = 'style_select'
                 self._apply_selected_style()
                 return None
             # Retake button
-            if self._is_in_button(x, y, self.screen_w//2 - 80, btn_y, 160, 50):
+            if self._is_in_button(x, y, self.screen_w//2 - 150, btn_y, 140, 50):
                 self.state = 'main_menu'
                 self.face_image = None
                 self.face_rgba = None
                 self._style_cache.clear()
+                return None
+            # Manual Select button
+            if self._is_in_button(x, y, self.screen_w//2, btn_y, 150, 50):
+                self._enter_manual_select()
                 return None
 
         elif self.state == 'style_select':
@@ -186,18 +213,19 @@ class FaceSwapUI:
         return (cx - w//2 <= mx <= cx + w//2) and (cy - h//2 <= my <= cy + h//2)
 
     def _do_camera_capture(self):
-        """Initiate camera capture."""
-        pg.display.iconify()  # Minimize pygame window
-        image = capture_from_camera()
-        # Restore pygame window
-        self.screen = pg.display.set_mode((self.screen_w, self.screen_h))
+        """Initiate camera capture using Pygame-embedded camera view."""
+        cam = CameraCapture(self.screen, self.detector)
+        image, bbox = cam.run()
 
         if image is not None:
             self.face_image = image
-            self.face_rgba = self.detector.extract_face(image)
+            self.face_rgba = self.detector.extract_face(image, bbox=bbox)
             if self.face_rgba is not None:
                 self.state = 'preview'
                 self._style_cache.clear()
+            else:
+                # Auto-detection failed, enter manual select mode
+                self._enter_manual_select()
 
     def _do_upload(self):
         """Initiate photo upload."""
@@ -208,6 +236,9 @@ class FaceSwapUI:
             if self.face_rgba is not None:
                 self.state = 'preview'
                 self._style_cache.clear()
+            else:
+                # Auto-detection failed, enter manual select mode
+                self._enter_manual_select()
 
     def _apply_selected_style(self):
         """Apply currently selected style to face, using cache if available."""
@@ -352,10 +383,154 @@ class FaceSwapUI:
                 self.screen.blit(face_surf, face_rect)
 
         # Buttons
-        self._draw_button("Retake", self.screen_w//2 - 80, 500, 160, 50,
+        self._draw_button("Retake", self.screen_w//2 - 150, 500, 140, 50,
                           self.RED, self.DARK_RED)
-        self._draw_button("Confirm", self.screen_w//2 + 80, 500, 160, 50,
+        self._draw_button("Manual Select", self.screen_w//2, 500, 150, 50,
+                          self.BLUE, self.LIGHT_BLUE)
+        self._draw_button("Confirm", self.screen_w//2 + 150, 500, 140, 50,
                           self.GREEN, self.DARK_GREEN)
+
+    def _enter_manual_select(self):
+        """Prepare and enter manual face selection mode."""
+        if self.face_image is None:
+            return
+        self.state = 'manual_select'
+        self._select_start = None
+        self._select_end = None
+        self._selecting = False
+        # Prepare scaled photo surface
+        max_w = self.screen_w - 40
+        max_h = self.screen_h - 120
+        h, w = self.face_image.shape[:2]
+        self._manual_scale = min(max_w / w, max_h / h)
+        new_w = int(w * self._manual_scale)
+        new_h = int(h * self._manual_scale)
+        resized = cv2.resize(self.face_image, (new_w, new_h))
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        self._manual_photo_surface = pg.image.frombuffer(rgb.tobytes(), (new_w, new_h), 'RGB')
+        self._manual_photo_rect = self._manual_photo_surface.get_rect(
+            center=(self.screen_w // 2, (self.screen_h - 60) // 2 + 20))
+
+    def _draw_manual_select(self):
+        """Draw the manual face selection interface."""
+        # Title
+        title = self.label_font.render("拖拽选取人脸区域", True, self.LIGHT_BLUE)
+        title_rect = title.get_rect(center=(self.screen_w // 2, 15))
+        self.screen.blit(title, title_rect)
+
+        # Draw photo
+        if self._manual_photo_surface and self._manual_photo_rect:
+            self.screen.blit(self._manual_photo_surface, self._manual_photo_rect)
+
+        # Draw selection rectangle
+        if self._select_start and self._select_end:
+            sx, sy = self._select_start
+            ex, ey = self._select_end
+            rect = pg.Rect(min(sx, ex), min(sy, ey), abs(ex - sx), abs(ey - sy))
+            if self._selecting:
+                # Dashed rectangle while dragging
+                self._draw_dashed_rect(self.screen, self.YELLOW, rect)
+            else:
+                # Solid rectangle when confirmed
+                pg.draw.rect(self.screen, self.GREEN, rect, 2)
+
+        # Buttons at bottom
+        btn_y = self.screen_h - 30
+        self._draw_button("Confirm", self.screen_w//2 + 80, btn_y, 140, 45,
+                          self.GREEN, self.DARK_GREEN)
+        self._draw_button("Back", self.screen_w//2 - 80, btn_y, 140, 45,
+                          self.DARK_GRAY, self.GRAY)
+
+    def _handle_manual_select_events(self, event):
+        """Handle mouse events for manual face selection."""
+        x, y = event.pos
+        # Check button clicks
+        btn_y = self.screen_h - 30
+        if self._is_in_button(x, y, self.screen_w//2 + 80, btn_y, 140, 45):
+            # Confirm: extract face with manual bbox
+            self._confirm_manual_select()
+            return
+        if self._is_in_button(x, y, self.screen_w//2 - 80, btn_y, 140, 45):
+            # Back
+            self.state = 'preview' if self.face_rgba else 'main_menu'
+            return
+        # Start selection drag
+        if self._manual_photo_rect and self._manual_photo_rect.collidepoint(x, y):
+            self._select_start = (x, y)
+            self._select_end = (x, y)
+            self._selecting = True
+
+    def _confirm_manual_select(self):
+        """Use manual selection bbox to extract face."""
+        if self._select_start is None or self._select_end is None:
+            return
+        if self.face_image is None or self._manual_photo_rect is None:
+            return
+
+        sx, sy = self._select_start
+        ex, ey = self._select_end
+        # Convert screen coords to photo coords
+        px = self._manual_photo_rect.x
+        py = self._manual_photo_rect.y
+        inv = 1.0 / self._manual_scale
+        x1 = int((min(sx, ex) - px) * inv)
+        y1 = int((min(sy, ey) - py) * inv)
+        x2 = int((max(sx, ex) - px) * inv)
+        y2 = int((max(sy, ey) - py) * inv)
+        # Clamp to image bounds
+        h, w = self.face_image.shape[:2]
+        x1 = max(0, min(x1, w))
+        y1 = max(0, min(y1, h))
+        x2 = max(0, min(x2, w))
+        y2 = max(0, min(y2, h))
+        if x2 - x1 < 10 or y2 - y1 < 10:
+            return
+        bbox = (x1, y1, x2 - x1, y2 - y1)
+        face = self.detector.extract_face(self.face_image, bbox=bbox)
+        if face is not None:
+            self.face_rgba = face
+            self._style_cache.clear()
+            self.state = 'preview'
+        else:
+            # Fallback: manual crop with ellipse mask
+            region = self.face_image[y1:y2, x1:x2].copy()
+            mask = np.zeros(region.shape[:2], dtype=np.uint8)
+            center = (region.shape[1] // 2, region.shape[0] // 2)
+            axes = (region.shape[1] // 2 - 2, region.shape[0] // 2 - 2)
+            cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
+            mask = cv2.GaussianBlur(mask, (7, 7), 3)
+            rgba = cv2.cvtColor(region, cv2.COLOR_BGR2BGRA)
+            rgba[:, :, 3] = mask
+            self.face_rgba = rgba
+            self._style_cache.clear()
+            self.state = 'preview'
+
+    def _draw_dashed_rect(self, surface, color, rect):
+        """Draw a dashed rectangle."""
+        dash_len = 8
+        gap_len = 5
+        lines = [
+            ((rect.left, rect.top), (rect.right, rect.top)),
+            ((rect.right, rect.top), (rect.right, rect.bottom)),
+            ((rect.right, rect.bottom), (rect.left, rect.bottom)),
+            ((rect.left, rect.bottom), (rect.left, rect.top)),
+        ]
+        for (x1, y1), (x2, y2) in lines:
+            length = math.hypot(x2 - x1, y2 - y1)
+            if length == 0:
+                continue
+            dx, dy = (x2 - x1) / length, (y2 - y1) / length
+            pos = 0.0
+            drawing = True
+            while pos < length:
+                seg_len = dash_len if drawing else gap_len
+                end_pos = min(pos + seg_len, length)
+                if drawing:
+                    p1 = (int(x1 + dx * pos), int(y1 + dy * pos))
+                    p2 = (int(x1 + dx * end_pos), int(y1 + dy * end_pos))
+                    pg.draw.line(surface, color, p1, p2, 2)
+                pos = end_pos
+                drawing = not drawing
 
     def _draw_style_select(self):
         """Draw the style selection screen with 2 style cards."""

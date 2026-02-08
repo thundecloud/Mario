@@ -36,13 +36,21 @@ class FaceDetector:
         BaseOptions = mp.tasks.BaseOptions
         VisionRunningMode = mp.tasks.vision.RunningMode
 
-        # Face detector
+        # Face detector (IMAGE mode for final extraction)
         det_options = mp.tasks.vision.FaceDetectorOptions(
             base_options=BaseOptions(model_asset_path=_FACE_DETECTOR_MODEL),
             running_mode=VisionRunningMode.IMAGE,
             min_detection_confidence=0.5,
         )
         self.face_detector = mp.tasks.vision.FaceDetector.create_from_options(det_options)
+
+        # Face detector (VIDEO mode for real-time preview)
+        det_options_video = mp.tasks.vision.FaceDetectorOptions(
+            base_options=BaseOptions(model_asset_path=_FACE_DETECTOR_MODEL),
+            running_mode=VisionRunningMode.VIDEO,
+            min_detection_confidence=0.5,
+        )
+        self.face_detector_video = mp.tasks.vision.FaceDetector.create_from_options(det_options_video)
 
         # Face landmarker
         lm_options = mp.tasks.vision.FaceLandmarkerOptions(
@@ -76,6 +84,24 @@ class FaceDetector:
 
         return (x, y, bw, bh)
 
+    def detect_face_fast(self, image, timestamp_ms):
+        """Fast face detection for real-time preview using VIDEO mode.
+        Downscales input to 320px width before detection.
+        Returns (x, y, w, h) in original image coordinates, or None."""
+        h, w = image.shape[:2]
+        scale = 320.0 / w
+        small = cv2.resize(image, (320, int(h * scale)))
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = self.face_detector_video.detect_for_video(mp_image, timestamp_ms)
+        if not result.detections:
+            return None
+        best = max(result.detections, key=lambda d: d.categories[0].score)
+        bbox = best.bounding_box
+        inv = 1.0 / scale
+        return (int(bbox.origin_x * inv), int(bbox.origin_y * inv),
+                int(bbox.width * inv), int(bbox.height * inv))
+
     def get_face_landmarks(self, image):
         """Get face mesh landmarks.
         Returns list of (x, y) pixel coordinates or None."""
@@ -93,11 +119,13 @@ class FaceDetector:
 
         return landmarks
 
-    def extract_face(self, image, padding=0.3):
+    def extract_face(self, image, padding=0.3, bbox=None):
         """Extract face region with alpha mask from image.
         Returns RGBA numpy array or None if no face detected.
-        padding: extra space around face as fraction of face size."""
-        bbox = self.detect_face_bbox(image)
+        padding: extra space around face as fraction of face size.
+        bbox: optional pre-computed (x, y, w, h) to skip detection."""
+        if bbox is None:
+            bbox = self.detect_face_bbox(image)
         if bbox is None:
             return None
 
@@ -159,4 +187,5 @@ class FaceDetector:
     def close(self):
         """Release resources."""
         self.face_detector.close()
+        self.face_detector_video.close()
         self.face_landmarker.close()
