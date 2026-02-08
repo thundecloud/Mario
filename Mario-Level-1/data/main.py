@@ -8,7 +8,7 @@ from . import constants as c
 # Global face swap data shared across game states
 face_swap_data = {
     'styled_face': None,  # BGRA numpy array of processed face
-    'style_name': None,   # 'pixel', 'original', or 'cartoon'
+    'style_name': None,   # 'sprite' or 'original'
     'enabled': False,
 }
 

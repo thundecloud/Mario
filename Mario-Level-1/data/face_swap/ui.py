@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import sys
 import os
+import threading
 
 # Add parent paths so we can import game modules
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -47,8 +48,19 @@ class FaceSwapUI:
         self.face_image = None      # Raw BGR image from capture
         self.face_rgba = None       # Extracted face RGBA (BGRA format)
         self.styled_face = None     # After style applied (BGRA format)
-        self.selected_style = 'pixel'
+        self.selected_style = 'sprite'
         self.state = 'main_menu'    # main_menu, preview, style_select
+
+        # Style cache: {style_name: bgra_array}
+        self._style_cache = {}
+
+        # Loading state for async style generation
+        self._loading = False
+        self._loading_thread = None
+        self._loading_result = None
+        self._loading_style = None
+        self._loading_dots = 0
+        self._loading_timer = 0
 
         # Font setup
         self.title_font = pg.font.SysFont('Microsoft YaHei', 48, bold=True)
@@ -71,10 +83,13 @@ class FaceSwapUI:
                         else:
                             self.state = 'main_menu'
                 elif event.type == pg.MOUSEBUTTONDOWN:
-                    if event.button == 1:
+                    if event.button == 1 and not self._loading:
                         result = self._handle_click(event.pos)
                         if result is not None:
                             return result
+
+            # Check if async loading finished
+            self._check_loading_done()
 
             self.screen.fill(self.BG_COLOR)
             if self.state == 'main_menu':
@@ -88,6 +103,21 @@ class FaceSwapUI:
             self.clock.tick(30)
 
         return None, None
+
+    def _check_loading_done(self):
+        """Check if async style generation thread has completed."""
+        if self._loading and self._loading_thread is not None:
+            if not self._loading_thread.is_alive():
+                result = self._loading_result
+                style = self._loading_style
+                self._loading = False
+                self._loading_thread = None
+                self._loading_result = None
+
+                if result is not None and style is not None:
+                    self._style_cache[style] = result
+                    if self.selected_style == style:
+                        self.styled_face = result
 
     def _handle_click(self, pos):
         """Handle mouse click at position. Returns result tuple or None."""
@@ -114,23 +144,25 @@ class FaceSwapUI:
             btn_y = 500
             if self._is_in_button(x, y, self.screen_w//2 + 80, btn_y, 160, 50):
                 self.state = 'style_select'
+                self._apply_selected_style()
                 return None
             # Retake button
             if self._is_in_button(x, y, self.screen_w//2 - 80, btn_y, 160, 50):
                 self.state = 'main_menu'
                 self.face_image = None
                 self.face_rgba = None
+                self._style_cache.clear()
                 return None
 
         elif self.state == 'style_select':
-            # Style buttons
-            styles = ['pixel', 'original', 'cartoon']
-            start_x = self.screen_w // 2 - 250
-            for i, style in enumerate(styles):
-                sx = start_x + i * 180
-                sy = 200
-                if sx <= x <= sx + 150 and sy <= y <= sy + 200:
-                    self.selected_style = style
+            # Style cards - 2 styles centered with 220px spacing
+            styles = [('sprite', 'Sprite Art'), ('original', 'Original')]
+            start_x = self.screen_w // 2 - 185  # Center 2 cards
+            for i, (style_key, _) in enumerate(styles):
+                sx = start_x + i * 220
+                sy = 160
+                if sx <= x <= sx + 150 and sy <= y <= sy + 230:
+                    self.selected_style = style_key
                     self._apply_selected_style()
                     return None
 
@@ -165,7 +197,7 @@ class FaceSwapUI:
             self.face_rgba = self.detector.extract_face(image)
             if self.face_rgba is not None:
                 self.state = 'preview'
-                self._apply_selected_style()
+                self._style_cache.clear()
 
     def _do_upload(self):
         """Initiate photo upload."""
@@ -175,12 +207,38 @@ class FaceSwapUI:
             self.face_rgba = self.detector.extract_face(image)
             if self.face_rgba is not None:
                 self.state = 'preview'
-                self._apply_selected_style()
+                self._style_cache.clear()
 
     def _apply_selected_style(self):
-        """Apply currently selected style to face."""
-        if self.face_rgba is not None:
-            self.styled_face = apply_style(self.face_rgba, self.selected_style)
+        """Apply currently selected style to face, using cache if available."""
+        if self.face_rgba is None:
+            return
+
+        style = self.selected_style
+
+        # Check cache
+        if style in self._style_cache:
+            self.styled_face = self._style_cache[style]
+            return
+
+        # For sprite style, run async since AI call may be slow
+        if style == 'sprite' and not self._loading:
+            self._loading = True
+            self._loading_style = style
+            self._loading_result = None
+            self._loading_timer = pg.time.get_ticks()
+            self._loading_dots = 0
+
+            face_copy = self.face_rgba.copy()
+            def _generate():
+                self._loading_result = apply_style(face_copy, style)
+            self._loading_thread = threading.Thread(target=_generate, daemon=True)
+            self._loading_thread.start()
+        else:
+            # Original style is fast, run sync
+            result = apply_style(self.face_rgba, style)
+            self._style_cache[style] = result
+            self.styled_face = result
 
     def _cv2_to_pg_surface(self, cv2_img, max_size=200):
         """Convert OpenCV image to Pygame surface, scaled to max_size."""
@@ -300,7 +358,7 @@ class FaceSwapUI:
                           self.GREEN, self.DARK_GREEN)
 
     def _draw_style_select(self):
-        """Draw the style selection screen."""
+        """Draw the style selection screen with 2 style cards."""
         title = self.title_font.render("Choose Style", True, self.GOLD)
         title_rect = title.get_rect(center=(self.screen_w // 2, 50))
         self.screen.blit(title, title_rect)
@@ -309,16 +367,15 @@ class FaceSwapUI:
         sub_rect = subtitle.get_rect(center=(self.screen_w // 2, 110))
         self.screen.blit(subtitle, sub_rect)
 
-        # Style cards
+        # Style cards - 2 styles centered
         styles = [
-            ('pixel', 'Pixel Art'),
+            ('sprite', 'Sprite Art'),
             ('original', 'Original'),
-            ('cartoon', 'Cartoon'),
         ]
 
-        start_x = self.screen_w // 2 - 250
+        start_x = self.screen_w // 2 - 185  # Center 2 cards with 220px spacing
         for i, (style_key, style_label) in enumerate(styles):
-            sx = start_x + i * 180
+            sx = start_x + i * 220
             sy = 160
 
             # Card background
@@ -329,14 +386,34 @@ class FaceSwapUI:
             pg.draw.rect(self.screen, card_color, card_rect, border_radius=10)
             pg.draw.rect(self.screen, border_color, card_rect, 3, border_radius=10)
 
-            # Style preview image
-            if self.face_rgba is not None:
-                styled = apply_style(self.face_rgba, style_key)
-                preview = self._cv2_to_pg_surface(styled, 120)
+            # Style preview image (from cache or generate)
+            is_loading_this = (self._loading and self._loading_style == style_key)
+            if is_loading_this:
+                # Show loading animation
+                now = pg.time.get_ticks()
+                if now - self._loading_timer > 500:
+                    self._loading_dots = (self._loading_dots + 1) % 4
+                    self._loading_timer = now
+                dots = "." * self._loading_dots
+                loading_text = self.label_font.render(f"Generating{dots}", True, self.GOLD)
+                loading_rect = loading_text.get_rect(center=(sx + 75, sy + 100))
+                self.screen.blit(loading_text, loading_rect)
+            elif style_key in self._style_cache:
+                preview = self._cv2_to_pg_surface(self._style_cache[style_key], 120)
                 if preview:
                     preview_rect = preview.get_rect(center=(sx + 75, sy + 100))
                     self._draw_checker(preview_rect)
                     self.screen.blit(preview, preview_rect)
+            elif self.face_rgba is not None:
+                # For original style, generate on the fly (fast)
+                if style_key == 'original':
+                    styled = apply_style(self.face_rgba, style_key)
+                    self._style_cache[style_key] = styled
+                    preview = self._cv2_to_pg_surface(styled, 120)
+                    if preview:
+                        preview_rect = preview.get_rect(center=(sx + 75, sy + 100))
+                        self._draw_checker(preview_rect)
+                        self.screen.blit(preview, preview_rect)
 
             # Label
             label = self.button_font.render(style_label, True, self.WHITE)
@@ -349,16 +426,33 @@ class FaceSwapUI:
                 self.screen.blit(check, (sx + 5, sy + 5))
 
         # Large preview of selected style
-        if self.styled_face is not None:
+        if self.styled_face is not None and not self._loading:
             label = self.label_font.render(f"Preview: {self.selected_style}", True, self.LIGHT_BLUE)
             label_rect = label.get_rect(center=(self.screen_w // 2, 420))
             self.screen.blit(label, label_rect)
 
+        # Loading indicator below cards
+        if self._loading:
+            now = pg.time.get_ticks()
+            if now - self._loading_timer > 500:
+                self._loading_dots = (self._loading_dots + 1) % 4
+                self._loading_timer = now
+            dots = "." * self._loading_dots
+            loading = self.label_font.render(f"Generating sprite{dots}", True, self.GOLD)
+            loading_rect = loading.get_rect(center=(self.screen_w // 2, 430))
+            self.screen.blit(loading, loading_rect)
+
         # Buttons
         self._draw_button("Back", self.screen_w//2 - 200, 500, 120, 50,
                           self.DARK_GRAY, self.GRAY)
-        self._draw_button("Start Game!", self.screen_w//2, 500, 280, 60,
-                          self.GREEN, self.DARK_GREEN)
+
+        if self._loading:
+            # Grayed out button while loading
+            self._draw_button("Generating...", self.screen_w//2, 500, 280, 60,
+                              self.DARK_GRAY)
+        else:
+            self._draw_button("Start Game!", self.screen_w//2, 500, 280, 60,
+                              self.GREEN, self.DARK_GREEN)
 
     def _draw_checker(self, rect):
         """Draw a checker pattern to show transparency."""

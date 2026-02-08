@@ -1,6 +1,6 @@
 """
 Sprite replacement system - replaces Mario's head in all sprite frames.
-Analyzes the sprite sheet and composites user face onto Mario's body.
+Uses proportion-based head detection and full head erasure before compositing.
 """
 
 import pygame as pg
@@ -8,117 +8,110 @@ import numpy as np
 import cv2
 
 
-# Head region definitions for each Mario sprite frame.
-# Format: (y_offset_from_top, head_height) in original sprite pixels (before scaling).
-# These define where the head starts and how tall it is within each sprite frame.
-
-# Small Mario sprites are 12-16 x 16 pixels
-# Head occupies roughly the top 8-9 pixels
-SMALL_MARIO_HEAD = {
-    'y_offset': 0,
-    'head_height': 9,
-    'sprite_height': 16,
-}
-
-# Big Mario sprites are 15-16 x 32 pixels
-# Head occupies roughly the top 15 pixels
-BIG_MARIO_HEAD = {
-    'y_offset': 0,
-    'head_height': 15,
-    'sprite_height': 32,
-}
-
-# Big Mario crouching sprites are 16 x 22 pixels
-# Head occupies roughly top 10 pixels
-BIG_MARIO_CROUCH_HEAD = {
-    'y_offset': 0,
-    'head_height': 10,
-    'sprite_height': 22,
-}
-
-
-def cv2_to_pygame(cv2_image_rgba):
-    """Convert an RGBA OpenCV image (numpy array) to a Pygame surface."""
-    # OpenCV uses BGRA, Pygame uses RGBA
-    rgba = cv2.cvtColor(cv2_image_rgba, cv2.COLOR_BGRA2RGBA)
+def cv2_to_pygame(cv2_image_bgra):
+    """Convert a BGRA OpenCV image (numpy array) to a Pygame surface."""
+    rgba = cv2.cvtColor(cv2_image_bgra, cv2.COLOR_BGRA2RGBA)
     h, w = rgba.shape[:2]
     surface = pg.image.frombuffer(rgba.tobytes(), (w, h), 'RGBA')
     return surface.convert_alpha()
 
 
 def pygame_to_cv2(surface):
-    """Convert a Pygame surface to an RGBA OpenCV image (numpy array)."""
+    """Convert a Pygame surface to a BGRA OpenCV image (numpy array)."""
     w, h = surface.get_size()
-    # Get raw pixel data as string
     raw = pg.image.tostring(surface, 'RGBA')
     rgba = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
-    # Convert RGBA to BGRA for OpenCV
     bgra = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA)
     return bgra
 
 
-def resize_face_to_head(face_rgba, head_width, head_height):
-    """Resize face image to fit head region while maintaining aspect ratio.
-    face_rgba: RGBA numpy array (OpenCV format, BGRA)
-    Returns resized RGBA numpy array."""
-    if face_rgba is None:
+def resize_face_to_head(face_bgra, head_width, head_height):
+    """Resize face image to fit head region, maintaining aspect ratio and centering.
+    Returns BGRA numpy array sized exactly (head_height, head_width, 4)."""
+    if face_bgra is None:
         return None
 
-    fh, fw = face_rgba.shape[:2]
-    # Calculate scale to fit within head region
-    scale = min(head_width / fw, head_height / fh)
-    new_w = int(fw * scale)
-    new_h = int(fh * scale)
+    fh, fw = face_bgra.shape[:2]
+    if fh == 0 or fw == 0:
+        return None
 
-    resized = cv2.resize(face_rgba, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    scale = min(head_width / fw, head_height / fh)
+    new_w = max(1, int(fw * scale))
+    new_h = max(1, int(fh * scale))
+
+    resized = cv2.resize(face_bgra, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
     # Center in head region
     result = np.zeros((head_height, head_width, 4), dtype=np.uint8)
-    x_offset = (head_width - new_w) // 2
-    y_offset = (head_height - new_h) // 2
-    result[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
+    x_off = (head_width - new_w) // 2
+    y_off = (head_height - new_h) // 2
+    result[y_off:y_off + new_h, x_off:x_off + new_w] = resized
 
     return result
 
 
-def composite_face_on_sprite(sprite_surface, face_rgba, head_config, size_multiplier):
-    """Composite processed face onto a single Mario sprite frame.
-    sprite_surface: Pygame Surface of the Mario sprite
-    face_rgba: RGBA numpy array (OpenCV BGRA format) of processed face
-    head_config: dict with y_offset, head_height, sprite_height
-    size_multiplier: the game's SIZE_MULTIPLIER value
-    Returns new Pygame Surface with face composited."""
-    if face_rgba is None:
+def alpha_blend(base, overlay, y_start, x_start):
+    """Alpha-blend overlay onto base array in-place.
+    Both are BGRA uint8 arrays."""
+    oh, ow = overlay.shape[:2]
+    bh, bw = base.shape[:2]
+
+    # Clip to bounds
+    y_end = min(y_start + oh, bh)
+    x_end = min(x_start + ow, bw)
+    oy_end = y_end - y_start
+    ox_end = x_end - x_start
+
+    if oy_end <= 0 or ox_end <= 0:
+        return
+
+    roi = base[y_start:y_end, x_start:x_end]
+    over = overlay[:oy_end, :ox_end]
+
+    alpha = over[:, :, 3:4].astype(np.float32) / 255.0
+    inv_alpha = 1.0 - alpha
+
+    roi[:, :, :3] = (over[:, :, :3].astype(np.float32) * alpha +
+                     roi[:, :, :3].astype(np.float32) * inv_alpha).astype(np.uint8)
+    roi[:, :, 3] = np.maximum(roi[:, :, 3], over[:, :, 3])
+
+
+def composite_face_on_sprite(sprite_surface, face_bgra, size_multiplier):
+    """Composite face onto a single sprite frame.
+    Automatically determines head region by proportion, erases original head,
+    then blends face in.
+    Returns new Pygame Surface."""
+    if face_bgra is None:
         return sprite_surface
 
     w, h = sprite_surface.get_size()
+    if w < 2 or h < 2:
+        return sprite_surface  # Skip 0x0 placeholders
 
-    # Calculate head region in scaled sprite
-    scaled_head_height = int(head_config['head_height'] * size_multiplier)
-    scaled_y_offset = int(head_config['y_offset'] * size_multiplier)
+    # Determine head region by proportion
+    original_h = round(h / size_multiplier)
+    # Big mario (32px): head ~47%; Big crouch (22px): ~47%; Small mario (16px): ~56%
+    if original_h > 20:
+        head_ratio = 0.47
+    else:
+        head_ratio = 0.56
+    head_h = max(1, int(h * head_ratio))
 
-    # Ensure head fits in sprite
-    scaled_head_height = min(scaled_head_height, h - scaled_y_offset)
+    # Convert sprite to numpy BGRA
+    arr = pygame_to_cv2(sprite_surface)
 
-    if scaled_head_height <= 0 or w <= 0:
-        return sprite_surface
+    # Erase original head pixels (set to fully transparent)
+    arr[0:head_h, :, :] = 0
 
-    # Resize face to fit head region
-    face_resized = resize_face_to_head(face_rgba, w, scaled_head_height)
+    # Resize face to head region
+    face_resized = resize_face_to_head(face_bgra, w, head_h)
     if face_resized is None:
-        return sprite_surface
+        return cv2_to_pygame(arr)
 
-    # Convert face from OpenCV BGRA to RGBA for Pygame
-    face_rgba_pg = cv2.cvtColor(face_resized, cv2.COLOR_BGRA2RGBA)
-    face_surface = pg.image.frombuffer(
-        face_rgba_pg.tobytes(), (face_rgba_pg.shape[1], face_rgba_pg.shape[0]), 'RGBA'
-    ).convert_alpha()
+    # Alpha blend face into head region
+    alpha_blend(arr, face_resized, 0, 0)
 
-    # Create new sprite surface
-    new_sprite = sprite_surface.copy()
-    new_sprite.blit(face_surface, (0, scaled_y_offset))
-
-    return new_sprite
+    return cv2_to_pygame(arr)
 
 
 class SpriteReplacer:
@@ -126,77 +119,57 @@ class SpriteReplacer:
 
     def __init__(self, size_multiplier=2.5):
         self.size_multiplier = size_multiplier
-        self.face_rgba = None  # Processed face in BGRA format
+        self.face_bgra = None
 
-    def set_face(self, face_rgba):
+    def set_face(self, face_bgra):
         """Set the face image to use for replacement.
-        face_rgba: RGBA numpy array in OpenCV BGRA format."""
-        self.face_rgba = face_rgba
+        face_bgra: numpy array in BGRA format."""
+        self.face_bgra = face_bgra
 
-    def replace_head_in_frame(self, sprite_surface, is_big=False, is_crouching=False):
-        """Replace the head in a single sprite frame.
-        sprite_surface: Pygame Surface
-        is_big: True for big/fire mario
-        is_crouching: True for crouching frame
+    def replace_head_in_frame(self, sprite_surface):
+        """Replace head in a single sprite frame.
         Returns new Pygame Surface."""
-        if self.face_rgba is None:
+        if self.face_bgra is None:
             return sprite_surface
-
-        if is_crouching:
-            head_config = BIG_MARIO_CROUCH_HEAD
-        elif is_big:
-            head_config = BIG_MARIO_HEAD
-        else:
-            head_config = SMALL_MARIO_HEAD
-
         return composite_face_on_sprite(
-            sprite_surface, self.face_rgba, head_config, self.size_multiplier
+            sprite_surface, self.face_bgra, self.size_multiplier
         )
 
     def replace_all_frames(self, mario_obj):
         """Replace heads in all of Mario's sprite frame lists.
-        mario_obj: the Mario sprite instance.
         Modifies frames in-place."""
-        if self.face_rgba is None:
+        if self.face_bgra is None:
             return
 
-        # Process small mario frames (right-facing)
+        # Process all small mario frames (right-facing)
         small_frame_lists = [
             mario_obj.right_small_normal_frames,
             mario_obj.right_small_green_frames,
             mario_obj.right_small_red_frames,
             mario_obj.right_small_black_frames,
         ]
-
         for frame_list in small_frame_lists:
             for i in range(len(frame_list)):
-                frame_list[i] = self.replace_head_in_frame(
-                    frame_list[i], is_big=False
-                )
+                frame_list[i] = self.replace_head_in_frame(frame_list[i])
 
-        # Process big mario frames (right-facing)
+        # Process all big mario frames (right-facing)
         big_frame_lists = [
             mario_obj.right_big_normal_frames,
             mario_obj.right_big_green_frames,
             mario_obj.right_big_red_frames,
             mario_obj.right_big_black_frames,
         ]
-
         for frame_list in big_frame_lists:
             for i in range(len(frame_list)):
-                is_crouch = (i == 7 and len(frame_list) > 7)
-                frame_list[i] = self.replace_head_in_frame(
-                    frame_list[i], is_big=True, is_crouching=is_crouch
-                )
+                frame_list[i] = self.replace_head_in_frame(frame_list[i])
 
         # Process fire mario frames (right-facing)
         for i in range(len(mario_obj.right_fire_frames)):
-            is_crouch = (i == 7)
             mario_obj.right_fire_frames[i] = self.replace_head_in_frame(
-                mario_obj.right_fire_frames[i], is_big=True, is_crouching=is_crouch
+                mario_obj.right_fire_frames[i]
             )
 
-        # Regenerate all left-facing frames by flipping right frames
+        # Regenerate all left-facing frames by flipping
         self._regenerate_left_frames(mario_obj)
 
         # Update current frame references

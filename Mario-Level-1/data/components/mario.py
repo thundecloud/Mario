@@ -36,8 +36,11 @@ class Mario(pg.sprite.Sprite):
                 replacer = SpriteReplacer(c.SIZE_MULTIPLIER)
                 replacer.set_face(face_swap_data['styled_face'])
                 replacer.replace_all_frames(self)
-        except (ImportError, Exception):
-            pass  # Silently skip if face swap not available
+        except ImportError:
+            pass
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"Face swap failed: {e}")
 
 
     def setup_timers(self):
