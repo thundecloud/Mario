@@ -11,13 +11,16 @@ class Mario(pg.sprite.Sprite):
         pg.sprite.Sprite.__init__(self)
         self.sprite_sheet = setup.GFX['mario_bros']
 
+        # Use AI-generated sprite sheet if available
+        self._apply_custom_sprite_sheet()
+
         self.setup_timers()
         self.setup_state_booleans()
         self.setup_forces()
         self.setup_counters()
         self.load_images_from_sheet()
 
-        # Apply face swap if enabled
+        # Fallback: per-frame head paste (old mode, only if no custom sheet)
         self._apply_face_swap()
 
         self.state = c.WALK
@@ -27,10 +30,23 @@ class Mario(pg.sprite.Sprite):
 
         self.key_timer = 0
 
-    def _apply_face_swap(self):
-        """Apply face swap to all Mario sprite frames if enabled."""
+    def _apply_custom_sprite_sheet(self):
+        """Use AI-generated sprite sheet if available."""
         try:
             from ..main import face_swap_data
+            custom = face_swap_data.get('custom_sprite_sheet')
+            if custom is not None:
+                self.sprite_sheet = custom
+        except (ImportError, Exception):
+            pass
+
+    def _apply_face_swap(self):
+        """Fallback: per-frame head paste (old mode)."""
+        try:
+            from ..main import face_swap_data
+            # Skip if already using custom sprite sheet
+            if face_swap_data.get('custom_sprite_sheet') is not None:
+                return
             if face_swap_data.get('enabled') and face_swap_data.get('styled_face') is not None:
                 from ..face_swap.sprite_replacer import SpriteReplacer
                 replacer = SpriteReplacer(c.SIZE_MULTIPLIER)

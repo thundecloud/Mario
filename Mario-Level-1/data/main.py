@@ -10,6 +10,7 @@ face_swap_data = {
     'styled_face': None,  # BGRA numpy array of processed face
     'style_name': None,   # 'sprite' or 'original'
     'enabled': False,
+    'custom_sprite_sheet': None,  # AI-generated complete sprite sheet (Pygame Surface)
 }
 
 

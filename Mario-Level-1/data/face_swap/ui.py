@@ -71,6 +71,9 @@ class FaceSwapUI:
         self._manual_photo_rect = None
         self._manual_scale = 1.0
 
+        # Sprite sheet generation result
+        self._sheet_result = None
+
         # Font setup
         self.title_font = pg.font.SysFont('Microsoft YaHei', 48, bold=True)
         self.button_font = pg.font.SysFont('Microsoft YaHei', 28)
@@ -198,6 +201,10 @@ class FaceSwapUI:
             if self._is_in_button(x, y, self.screen_w//2, btn_y, 280, 60):
                 if self.styled_face is not None:
                     self.detector.close()
+                    # Store sprite sheet in global data if available
+                    if self._sheet_result is not None:
+                        from ..main import face_swap_data
+                        face_swap_data['custom_sprite_sheet'] = self._sheet_result
                     return (self.styled_face, self.selected_style)
 
             # Back button
@@ -257,12 +264,27 @@ class FaceSwapUI:
             self._loading = True
             self._loading_style = style
             self._loading_result = None
+            self._sheet_result = None
             self._loading_timer = pg.time.get_ticks()
             self._loading_dots = 0
 
             face_copy = self.face_rgba.copy()
             def _generate():
+                # Try to generate full sprite sheet
+                try:
+                    from .sprite_sheet_gen import SpriteSheetGenerator
+                    from .. import setup
+                    gen = SpriteSheetGenerator()
+                    sheet = gen.generate(face_copy, setup.GFX['mario_bros'])
+                    self._sheet_result = sheet
+                except Exception as e:
+                    import logging
+                    logging.getLogger(__name__).warning(f"Sprite sheet generation failed: {e}")
+                    self._sheet_result = None
+
+                # Also generate preview styled face (for UI display)
                 self._loading_result = apply_style(face_copy, style)
+
             self._loading_thread = threading.Thread(target=_generate, daemon=True)
             self._loading_thread.start()
         else:
